@@ -1,11 +1,11 @@
-from typing import get_type_hints
+import typing
 
 import dataclasses
 from graphql import GraphQLField
 
 from .constants import IS_STRAWBERRY_FIELD, IS_STRAWBERRY_INPUT
 from .exceptions import MissingArgumentsAnnotationsError, MissingReturnAnnotationError
-from .type_converter import get_graphql_type_for_annotation
+from .type_converter import REGISTRY, get_graphql_type_for_annotation
 from .utils.dict_to_type import dict_to_type
 from .utils.inspect import get_func_args
 from .utils.str_converters import to_camel_case, to_snake_case
@@ -15,6 +15,69 @@ from .utils.typing import (
     is_list,
     is_optional,
 )
+
+
+def lazy_property(fn):
+    """Decorator that makes a property lazy-evaluated.
+    """
+    attr_name = "_lazy_" + fn.__name__
+
+    @property
+    def _lazy_property(self):
+        if not hasattr(self, attr_name):
+            setattr(self, attr_name, fn(self))
+        return getattr(self, attr_name)
+
+    return _lazy_property
+
+
+class Wrapper:
+    def __init__(self, obj, is_subscription, **kwargs):
+        self._wrapped_obj = obj
+        self.is_subscription = is_subscription
+        self.kwargs = kwargs
+
+        if callable(self._wrapped_obj):
+            self._check_has_annotations()
+
+    def _check_has_annotations(self):
+        # using standard annotation as we don't need the actual types
+        annotations = self._wrapped_obj.__annotations__
+        name = self._wrapped_obj.__name__
+
+        if "return" not in annotations:
+            raise MissingReturnAnnotationError(name)
+
+        function_arguments = set(get_func_args(self._wrapped_obj)) - {"self", "info"}
+
+        arguments_annotations = {
+            key: value
+            for key, value in annotations.items()
+            if key not in ["info", "return"]
+        }
+
+        annotated_function_arguments = set(arguments_annotations.keys())
+        arguments_missing_annotations = (
+            function_arguments - annotated_function_arguments
+        )
+
+        if len(arguments_missing_annotations) > 0:
+            raise MissingArgumentsAnnotationsError(name, arguments_missing_annotations)
+
+    def __getattr__(self, attr):
+        if attr in self.__dict__:
+            return getattr(self, attr)
+
+        return getattr(self._wrapped_obj, attr)
+
+    def __call__(self, *args, **kwargs):
+        return self._wrapped_obj(self, *args, **kwargs)
+
+    @lazy_property
+    def field(self):
+        return _get_field(
+            self._wrapped_obj, is_subscription=self.is_subscription, **self.kwargs
+        )
 
 
 class strawberry_field:
@@ -51,10 +114,9 @@ class strawberry_field:
 
         self.kwargs["description"] = self.description or wrap.__doc__
 
-        wrap.field = _get_field(
-            wrap, is_subscription=self.is_subscription, **self.kwargs
-        )
-        return wrap
+        # wrap.field = lazy_property(lambda: )
+
+        return Wrapper(wrap, self.is_subscription, **self.kwargs)
 
 
 def convert_args(args, annotations):
@@ -91,7 +153,7 @@ def convert_args(args, annotations):
 
 
 def _get_field(wrap, *, is_subscription=False, **kwargs):
-    annotations = get_type_hints(wrap)
+    annotations = typing.get_type_hints(wrap, None, REGISTRY)
 
     name = wrap.__name__
 
